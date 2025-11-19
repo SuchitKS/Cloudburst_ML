@@ -1,0 +1,19 @@
+# Core ML & Data
+pandas
+numpy
+scikit-learn
+xgboost
+
+# Live GFS Data
+herbie-data
+xarray
+requests
+
+# Verification (from your script)
+feedparser
+beautifulsoup4
+transformers
+torch
+
+streamlit
+
