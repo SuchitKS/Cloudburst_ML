@@ -14,7 +14,7 @@ import verification_scraper_module as scraper_module
 
 warnings.filterwarnings('ignore')
 
-# --- PAGE SETUP (Standard Clean Look) ---
+# --- PAGE SETUP ---
 st.set_page_config(page_title="FloodWatch AI", page_icon="🌊", layout="wide")
 
 st.title("🌊 FloodWatch AI: Early Warning System")
@@ -40,7 +40,7 @@ if not bst:
     st.error("❌ CRITICAL ERROR: Model files not found. Please upload 'xgb_flood_model.json' and 'model_columns.json'.")
     st.stop()
 
-# --- DATA FETCHING FUNCTIONS ---
+# --- DATA FETCHING ---
 
 def get_gfs_date():
     now_utc = datetime.utcnow()
@@ -51,76 +51,56 @@ def get_gfs_date():
     return date
 
 def fetch_single_point(lat, lon):
-    """Downloads data for a specific location (Tab 1)"""
-    status = st.empty()
-    status.info(f"📡 Connecting to NOAA Satellite for {lat}, {lon}...")
-    
     try:
         date = get_gfs_date()
         H = Herbie(date=date, model='gfs', product='pgrb2.0p25', fxx=6, save_dir='herbie_cache')
-        
         variables = {
             'dpt': 'DPT:2 m above ground', 'lhtfl': 'LHTFL:surface', 
             'shtfl': 'SHTFL:surface', 'tcdc': 'TCDC:entire atmosphere', 
             'clwmr': 'CLWMR:entire atmosphere', 'ugrd': 'UGRD:10 m above ground', 
             'vgrd': 'VGRD:10 m above ground'
         }
-        
         data = {'lat': lat, 'lon': lon}
-        for var, search in variables.items():
+        for v, search in variables.items():
             try:
                 ds = H.xarray(f":{search}:")
                 if isinstance(ds, list): ds = ds[0]
                 val = ds.sel(latitude=lat, longitude=lon, method='nearest')
-                data[var] = float(list(val.data_vars.values())[0].values)
-            except: data[var] = 0.0
-        
-        status.success("✅ Satellite Data Acquired!")
+                data[v] = float(list(val.data_vars.values())[0].values)
+            except: data[v] = 0.0
         return data
-    except Exception as e:
-        status.error(f"Connection Failed: {e}")
-        return None
+    except: return None
 
 def fetch_india_grid():
-    """Downloads the MASSIVE grid for Auto-Scan (Tab 2)"""
     status = st.empty()
     status.info("📡 Downloading Full India Grid (15,000+ points). This takes ~30 seconds...")
-    
     try:
         date = get_gfs_date()
         H = Herbie(date=date, model='gfs', product='pgrb2.0p25', fxx=6, save_dir='herbie_cache')
-        
         variables = {
             'dpt': 'DPT:2 m above ground', 'lhtfl': 'LHTFL:surface', 
             'shtfl': 'SHTFL:surface', 'tcdc': 'TCDC:entire atmosphere', 
             'clwmr': 'CLWMR:entire atmosphere', 'ugrd': 'UGRD:10 m above ground', 
             'vgrd': 'VGRD:10 m above ground'
         }
-        
         all_data = {}
         coords = None
         bar = st.progress(0)
-        
         for i, (var, search) in enumerate(variables.items()):
             try:
                 ds = H.xarray(f":{search}:")
                 if isinstance(ds, list): ds = ds[0]
-                
-                # Crop to India Box
                 ds_india = ds.sel(latitude=slice(37, 6), longitude=slice(68, 98))
-                
                 if coords is None:
                     lats = ds_india.latitude.values
                     lons = ds_india.longitude.values
                     if lats.ndim == 1: lon_grid, lat_grid = np.meshgrid(lons, lats)
                     else: lon_grid, lat_grid = lons, lats
                     coords = {'lat': lat_grid.flatten(), 'lon': lon_grid.flatten()}
-                
                 val_key = list(ds_india.data_vars.keys())[0]
                 all_data[var] = ds_india[val_key].values.flatten()
             except: pass
             bar.progress((i+1)/len(variables))
-            
         if coords:
             df = pd.DataFrame(coords)
             for v, d in all_data.items():
@@ -135,34 +115,27 @@ def fetch_india_grid():
         return None
 
 # --- PREDICTION LOGIC ---
-
 def process_data_and_predict(df_raw):
     df = df_raw.copy()
     df = df.rename(columns={'dpt':'dew2m', 'lhtfl':'latent_flux', 'shtfl':'sensible_flux', 'tcdc':'cloud_cover', 'clwmr':'cloud_liquid'})
-    
-    # Unit Corrections
     if 'latent_flux' in df.columns: df['latent_flux'] *= -3600
     if 'sensible_flux' in df.columns: df['sensible_flux'] *= -3600
     if 'cloud_cover' in df.columns: df['cloud_cover'] /= 100.0
-    
     if 'ugrd' in df.columns and 'vgrd' in df.columns:
         df['wind_speed'] = np.sqrt(df['ugrd']**2 + df['vgrd']**2)
     else: df['wind_speed'] = 0.0
-        
     df['month'] = datetime.now().month
     df['year'] = datetime.now().year
-    
     for c in model_cols:
         if c not in df.columns: df[c] = 0.0
-        
     dmat = xgb.DMatrix(df[model_cols])
     df['risk_score'] = bst.predict(dmat)
     return df
 
-# --- TABS INTERFACE ---
+# --- TABS ---
 tab1, tab2 = st.tabs(["📍 Check Specific Location", "🚨 Auto-Scan High Risk Zones"])
 
-# --- TAB 1: MANUAL CHECK (Standard UI) ---
+# --- TAB 1: MANUAL CHECK ---
 with tab1:
     st.subheader("Inspect a Specific Location")
     c1, c2, c3 = st.columns([1, 1, 2])
@@ -172,65 +145,49 @@ with tab1:
     
     if st.button("🔍 Run Analysis", type="primary"):
         data = fetch_single_point(input_lat, input_lon)
-        
         if data:
-            # 1. Science Score
             df = pd.DataFrame([data])
             res = process_data_and_predict(df)
             risk = res['risk_score'].iloc[0]
-            
             st.divider()
             col_a, col_b, col_c = st.columns(3)
             col_a.metric("🛰️ Satellite Probability", f"{risk:.1%}")
-            
-            # 2. News Score
             with st.spinner(f"📰 Checking News for {city_name}..."):
                 scraper_module.clear_cache_for_new_location()
                 scraper = scraper_module.VerificationScraper(location=city_name, hours_lookback=24)
                 news_data = scraper.scrape_all()
-                
                 text_score = 0.0
                 if not news_data.empty:
                     text_score = 0.95 
                     col_b.metric("📰 News Signals", f"{len(news_data)} Articles", delta="Confirmed")
-                    with st.expander("View Articles"):
-                        st.dataframe(news_data[['title', 'published_date']])
-                else:
-                    col_b.metric("📰 News Signals", "0 Articles", delta="Silent", delta_color="off")
-
-            # 3. Fusion
+                    with st.expander("View Articles"): st.dataframe(news_data[['title', 'published_date']])
+                else: col_b.metric("📰 News Signals", "0 Articles", delta="Silent", delta_color="off")
             final_score = (risk * 0.8) + (text_score * 0.2)
             col_c.metric("🔥 Final Confidence", f"{final_score:.1%}")
-            
             st.divider()
-            if final_score > 0.75:
-                st.error(f"🚨 DISASTER ALERT ISSUED FOR {city_name.upper()}")
-            elif final_score > 0.40:
-                st.warning(f"⚠️ CAUTION: Unstable Weather in {city_name.upper()}")
-            else:
-                st.success(f"✅ SAFE: No imminent threat for {city_name.upper()}")
+            if final_score > 0.75: st.error(f"🚨 DISASTER ALERT ISSUED FOR {city_name.upper()}")
+            elif final_score > 0.40: st.warning(f"⚠️ CAUTION: Unstable Weather in {city_name.upper()}")
+            else: st.success(f"✅ SAFE: No imminent threat for {city_name.upper()}")
 
-# --- TAB 2: AUTO SCAN (NEW BACKEND, SIMPLE UI) ---
+# --- TAB 2: AUTO SCAN (FIXED WITH SESSION STATE) ---
 with tab2:
     st.subheader("🤖 Autonomous National Scanner")
-    st.write("Scanning **15,000+ Grid Points** across India. Filtering for Indian Cities only.")
+    st.write("Scanning **15,000+ Grid Points** across India.")
     
+    # Initialize Session State to store results
+    if 'scan_data' not in st.session_state:
+        st.session_state['scan_data'] = None
+
+    # Run Scan ONLY when button is clicked
     if st.button("🚀 INITIATE SATELLITE SCAN", type="primary"):
-        
-        # 1. Get Grid
         grid_df = fetch_india_grid()
         
         if grid_df is not None:
             st.write("Analyzing Physics & Risks...")
             results_df = process_data_and_predict(grid_df)
-            
             st.write("Filtering Locations...")
             
-            # 2. Filter for India Logic
-            # Take Top 500 risky points first (to avoid geocoding 15,000 points which is slow)
             candidates = results_df.nlargest(500, 'risk_score').copy()
-            
-            # Reverse Geocode
             coords = list(zip(candidates['lat'], candidates['lon']))
             geo_results = rg.search(coords)
             
@@ -238,34 +195,39 @@ with tab2:
             candidates['State'] = [x['admin1'] for x in geo_results]
             candidates['Country'] = [x['cc'] for x in geo_results]
             
-            # Keep only India ('IN')
             india_risks = candidates[candidates['Country'] == 'IN'].head(10)
+            if india_risks.empty: india_risks = candidates.head(5)
             
-            if india_risks.empty:
-                st.warning("No high risks found inside India. Showing nearest neighbors.")
-                india_risks = candidates.head(5)
+            # Save to Session State (Memory)
+            st.session_state['scan_data'] = india_risks
+    
+    # Display Results (from Memory)
+    if st.session_state['scan_data'] is not None:
+        india_risks = st.session_state['scan_data']
+        
+        m = folium.Map(location=[20.59, 78.96], zoom_start=5, tiles="CartoDB dark_matter")
+        
+        map_data = []
+        for _, row in india_risks.iterrows():
+            risk_pct = row['risk_score'] * 100
+            color = "red" if risk_pct > 75 else "orange"
             
-            # 3. Show Map
-            m = folium.Map(location=[20.59, 78.96], zoom_start=5, tiles="CartoDB dark_matter")
+            folium.CircleMarker(
+                location=[row['lat'], row['lon']],
+                radius=8, color=color, fill=True, fill_color=color,
+                popup=f"{row['City']}: {risk_pct:.1f}%"
+            ).add_to(m)
             
-            map_data = []
-            for _, row in india_risks.iterrows():
-                risk_pct = row['risk_score'] * 100
-                color = "red" if risk_pct > 75 else "orange"
-                
-                folium.CircleMarker(
-                    location=[row['lat'], row['lon']],
-                    radius=8, color=color, fill=True, fill_color=color,
-                    popup=f"{row['City']}: {risk_pct:.1f}%"
-                ).add_to(m)
-                
-                map_data.append({
-                    "Location": f"{row['City']}, {row['State']}",
-                    "Risk %": f"{risk_pct:.1f}%",
-                    "Status": "🚨 DANGER" if risk_pct > 75 else "⚠️ CAUTION"
-                })
-            
-            st_folium(m, width=800, height=500)
-            
-            st.subheader("🚨 Top Risk Zones Detected")
-            st.table(pd.DataFrame(map_data))
+            map_data.append({
+                "Location": f"{row['City']}, {row['State']}",
+                "Risk %": f"{risk_pct:.1f}%",
+                "Status": "🚨 DANGER" if risk_pct > 75 else "⚠️ CAUTION"
+            })
+        
+        st_folium(m, width=800, height=500)
+        st.subheader("🚨 Top Risk Zones Detected")
+        st.table(pd.DataFrame(map_data))
+        
+        if st.button("Clear Results"):
+            st.session_state['scan_data'] = None
+            st.rerun()
