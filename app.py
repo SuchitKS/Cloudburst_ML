@@ -145,9 +145,10 @@ def predict_risk(data_dict):
 
 # --- SIDEBAR DASHBOARD ---
 with st.sidebar:
-    st_lottie(lottie_satellite, height=150, key="sidebar_anim")
-    st.header("⚙️ System Controls")
-    st.info("System Status: 🟢 ONLINE")
+    if lottie_satellite:
+        st_lottie(lottie_satellite, height=150, key="sidebar_anim")
+    else:
+        st.image("https://cdn-icons-png.flaticon.com/512/1055/1055644.png", width=100) # Static fallback
     
     app_mode = st.selectbox("Select Mode", ["📍 Single Location Check", "🚨 National Auto-Scan"])
     st.divider()
@@ -270,3 +271,4 @@ elif app_mode == "🚨 National Auto-Scan":
             st.subheader("Threat Log")
             df_res = pd.DataFrame(results_table)
             st.dataframe(df_res, hide_index=True)
+
