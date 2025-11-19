@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from herbie import Herbie
 import os
 import warnings
-# Import your existing scraper file
+import reverse_geocoder as rg  # <--- NEW: Converts Lat/Lon to City Name
 import verification_scraper_module as scraper_module
 
 warnings.filterwarnings('ignore')
@@ -55,23 +55,24 @@ if not bst:
     st.error("❌ CRITICAL ERROR: Model files not found. Please upload 'xgb_flood_model.json' and 'model_columns.json' to GitHub.")
     st.stop()
 
-# --- GFS DOWNLOADER ---
+# --- HELPER: CALCULATE GFS DATE ---
+def get_gfs_date():
+    now_utc = datetime.utcnow()
+    hour = now_utc.hour
+    cycle = 18 if hour >= 22 else 12 if hour >= 16 else 6 if hour >= 10 else 0
+    date = now_utc.replace(hour=cycle, minute=0, second=0, microsecond=0)
+    if cycle == 18 and hour < 4: date -= timedelta(days=1)
+    return date
+
+# --- HELPER: SINGLE POINT FETCH (For Tab 1) ---
 def fetch_satellite_data(lat, lon):
     status_container = st.empty()
     status_container.info(f"📡 Connecting to NOAA Satellite Grid for {lat}, {lon}...")
     
     try:
-        # 1. Calculate Cycle
-        now_utc = datetime.utcnow()
-        hour = now_utc.hour
-        cycle = 18 if hour >= 22 else 12 if hour >= 16 else 6 if hour >= 10 else 0
-        forecast_date = now_utc.replace(hour=cycle, minute=0, second=0, microsecond=0)
-        if cycle == 18 and hour < 4: forecast_date -= timedelta(days=1)
+        date = get_gfs_date()
+        H = Herbie(date=date, model='gfs', product='pgrb2.0p25', fxx=6, save_dir='herbie_cache')
         
-        # 2. Download
-        H = Herbie(date=forecast_date, model='gfs', product='pgrb2.0p25', fxx=6, save_dir='herbie_cache')
-        
-        # 3. Variables
         variables = {
             'dpt': 'DPT:2 m above ground', 'lhtfl': 'LHTFL:surface', 
             'shtfl': 'SHTFL:surface', 'tcdc': 'TCDC:entire atmosphere', 
@@ -80,7 +81,6 @@ def fetch_satellite_data(lat, lon):
         }
         
         data = {'lat': lat, 'lon': lon}
-        
         for var, search in variables.items():
             try:
                 ds = H.xarray(f":{search}:")
@@ -92,17 +92,77 @@ def fetch_satellite_data(lat, lon):
                 
         status_container.success("✅ Satellite Data Acquired!")
         return data
-        
     except Exception as e:
         status_container.error(f"❌ Satellite Link Failed: {e}")
         return None
 
-def predict_risk(data_dict):
-    # Format Data
+# --- HELPER: MASSIVE GRID FETCH (For Tab 2) ---
+def fetch_india_grid():
+    status = st.empty()
+    status.info("📡 Downloading Full India Grid (This takes ~30 seconds)...")
+    
+    try:
+        date = get_gfs_date()
+        H = Herbie(date=date, model='gfs', product='pgrb2.0p25', fxx=6, save_dir='herbie_cache')
+        
+        variables = {
+            'dpt': 'DPT:2 m above ground', 'lhtfl': 'LHTFL:surface', 
+            'shtfl': 'SHTFL:surface', 'tcdc': 'TCDC:entire atmosphere', 
+            'clwmr': 'CLWMR:entire atmosphere', 'ugrd': 'UGRD:10 m above ground', 
+            'vgrd': 'VGRD:10 m above ground'
+        }
+        
+        all_data = {}
+        coords = None
+        bar = st.progress(0)
+        
+        for i, (var, search) in enumerate(variables.items()):
+            try:
+                ds = H.xarray(f":{search}:")
+                if isinstance(ds, list): ds = ds[0]
+                
+                # Slice for India (Lat 37 to 6, Lon 68 to 98)
+                ds_india = ds.sel(latitude=slice(37, 6), longitude=slice(68, 98))
+                
+                # Save Coords once
+                if coords is None:
+                    lats = ds_india.latitude.values
+                    lons = ds_india.longitude.values
+                    # Handle 1D vs 2D coordinates
+                    if lats.ndim == 1:
+                        lon_grid, lat_grid = np.meshgrid(lons, lats)
+                    else:
+                        lon_grid, lat_grid = lons, lats
+                    coords = {'lat': lat_grid.flatten(), 'lon': lon_grid.flatten()}
+                
+                # Flatten data
+                val_key = list(ds_india.data_vars.keys())[0]
+                all_data[var] = ds_india[val_key].values.flatten()
+                
+            except:
+                pass # Skip missing vars
+            
+            bar.progress((i+1)/len(variables))
+            
+        if coords:
+            df = pd.DataFrame(coords)
+            for v, d in all_data.items():
+                if v not in df.columns:
+                    if d is not None and len(d) == len(df): df[v] = d
+                    else: df[v] = 0.0
+            
+            status.success(f"✅ Grid Scan Complete! ({len(df)} points analyzed)")
+            return df
+        return None
+    except Exception as e:
+        status.error(f"Grid Scan Failed: {e}")
+        return None
+
+# --- PREDICTION FUNCTIONS ---
+def predict_single_risk(data_dict):
     df = pd.DataFrame([data_dict])
     df = df.rename(columns={'dpt':'dew2m', 'lhtfl':'latent_flux', 'shtfl':'sensible_flux', 'tcdc':'cloud_cover', 'clwmr':'cloud_liquid'})
     
-    # Unit Fixes (Crucial)
     df['latent_flux'] *= -3600
     df['sensible_flux'] *= -3600
     df['cloud_cover'] /= 100.0
@@ -113,14 +173,38 @@ def predict_risk(data_dict):
     for c in model_cols:
         if c not in df.columns: df[c] = 0.0
         
+    return float(bst.predict(xgb.DMatrix(df[model_cols]))[0])
+
+def predict_grid_risk(df_raw):
+    """Vectorized prediction for thousands of points at once"""
+    df = df_raw.copy()
+    df = df.rename(columns={'dpt':'dew2m', 'lhtfl':'latent_flux', 'shtfl':'sensible_flux', 'tcdc':'cloud_cover', 'clwmr':'cloud_liquid'})
+    
+    # Vectorized Math (Fast)
+    if 'latent_flux' in df.columns: df['latent_flux'] *= -3600
+    if 'sensible_flux' in df.columns: df['sensible_flux'] *= -3600
+    if 'cloud_cover' in df.columns: df['cloud_cover'] /= 100.0
+    
+    if 'ugrd' in df.columns and 'vgrd' in df.columns:
+        df['wind_speed'] = np.sqrt(df['ugrd']**2 + df['vgrd']**2)
+    else:
+        df['wind_speed'] = 0.0
+        
+    df['month'] = datetime.now().month
+    df['year'] = datetime.now().year
+    
+    for c in model_cols:
+        if c not in df.columns: df[c] = 0.0
+        
     # Predict
-    risk = float(bst.predict(xgb.DMatrix(df[model_cols]))[0])
-    return risk
+    dmat = xgb.DMatrix(df[model_cols])
+    df['risk_score'] = bst.predict(dmat)
+    return df
 
 # --- TABS ---
 tab1, tab2 = st.tabs(["📍 Check Specific Location", "🚨 Auto-Scan High Risk Zones"])
 
-# --- TAB 1: MANUAL CHECK ---
+# --- TAB 1: MANUAL CHECK (UNCHANGED) ---
 with tab1:
     st.subheader("Inspect a Specific Location")
     c1, c2, c3 = st.columns([1, 1, 2])
@@ -133,7 +217,7 @@ with tab1:
         
         if data:
             # 1. Science Score
-            science_risk = predict_risk(data)
+            science_risk = predict_single_risk(data)
             
             st.divider()
             col_a, col_b, col_c = st.columns(3)
@@ -147,7 +231,7 @@ with tab1:
                 
                 text_score = 0.0
                 if not news_data.empty:
-                    text_score = 0.95 # Simulating high confidence if articles exist
+                    text_score = 0.95 
                     col_b.metric("📰 News Signals", f"{len(news_data)} Articles", delta="Confirmed")
                     with st.expander("View Source Articles"):
                         st.dataframe(news_data[['title', 'published_date', 'source']])
@@ -167,61 +251,52 @@ with tab1:
             else:
                 st.success(f"✅ SAFE: No imminent threat for {city_name.upper()}")
 
-# --- TAB 2: AUTO SCAN ---
+# --- TAB 2: AUTO SCAN (NEW GRID LOGIC) ---
 with tab2:
     st.subheader("🤖 Autonomous National Scanner")
-    st.write("Scanning 10 strategic high-risk zones across India in real-time.")
+    st.write("Scanning **15,000+ Grid Points** across India to find the absolute highest risk zones.")
     
     if st.button("Start Satellite Scan"):
-        # List of strategic points to check
-        zones = [
-            {"City": "Chennai", "Lat": 13.08, "Lon": 80.27},
-            {"City": "Mumbai", "Lat": 19.07, "Lon": 72.87},
-            {"City": "Delhi NCR", "Lat": 28.61, "Lon": 77.20},
-            {"City": "Bangalore", "Lat": 12.97, "Lon": 77.59},
-            {"City": "Kolkata", "Lat": 22.57, "Lon": 88.36},
-            {"City": "Kedarnath", "Lat": 30.73, "Lon": 79.07},
-            {"City": "Nicobar Islands", "Lat": 6.00, "Lon": 92.50},
-            {"City": "Guwahati", "Lat": 26.14, "Lon": 91.73},
-            {"City": "Cochin", "Lat": 9.93, "Lon": 76.26},
-            {"City": "Hyderabad", "Lat": 17.38, "Lon": 78.48}
-        ]
         
-        results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        # 1. Download & Predict
+        grid_df = fetch_india_grid()
         
-        for i, zone in enumerate(zones):
-            status_text.text(f"🛰️ Scanning Sector: {zone['City']}...")
-            d = fetch_satellite_data(zone['Lat'], zone['Lon'])
+        if grid_df is not None:
+            st.write("Analyzing Atmospheric Physics...")
+            results_df = predict_grid_risk(grid_df)
             
-            if d:
-                risk = predict_risk(d)
-                
-                # Determine Status
+            # 2. Get Top 10 Riskiest Points
+            top_risks = results_df.nlargest(10, 'risk_score').copy()
+            
+            # 3. Convert Coords to City Names (Reverse Geocoding)
+            st.write("Identifying Locations...")
+            coords = list(zip(top_risks['lat'], top_risks['lon']))
+            geo_results = rg.search(coords)
+            
+            top_risks['Location'] = [f"{x['name']}, {x['admin1']}" for x in geo_results]
+            
+            # 4. Display Results Table
+            display_data = []
+            for idx, row in top_risks.iterrows():
+                risk = row['risk_score']
                 status = "SAFE"
                 if risk > 0.75: status = "🚨 DANGER"
                 elif risk > 0.40: status = "⚠️ CAUTION"
                 
-                results.append({
-                    "Location": zone['City'],
+                display_data.append({
+                    "Location": row['Location'],
                     "Risk %": f"{risk:.1%}",
                     "Raw Score": risk,
-                    "Status": status
+                    "Status": status,
+                    "Lat/Lon": f"{row['lat']:.2f}, {row['lon']:.2f}"
                 })
             
-            progress_bar.progress((i + 1) / len(zones))
+            df_display = pd.DataFrame(display_data)
+            st.table(df_display[["Location", "Risk %", "Status", "Lat/Lon"]])
             
-        status_text.text("✅ Scan Complete.")
-        
-        # Display Results
-        results_df = pd.DataFrame(results).sort_values("Raw Score", ascending=False)
-        
-        st.table(results_df[["Location", "Risk %", "Status"]])
-        
-        # Highlight Worst
-        worst = results_df.iloc[0]
-        if worst['Raw Score'] > 0.75:
-            st.error(f"🚨 PRIORITY ALERT: {worst['Location']} is at {worst['Risk %']} Risk!")
-        else:
-            st.success("✅ National Scan: No major threats detected.")
+            # Highlight Worst
+            worst = df_display.iloc[0]
+            if worst['Raw Score'] > 0.75:
+                st.error(f"🚨 PRIORITY ALERT: {worst['Location']} is at {worst['Risk %']} Risk!")
+            else:
+                st.success("✅ National Scan: No major threats detected.")
