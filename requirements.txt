@@ -1,17 +1,19 @@
-streamlit
+# Core ML & Data
 pandas
 numpy
+scikit-learn
 xgboost
+
+# Live GFS Data
 herbie-data
 xarray
-cfgrib
-scikit-learn
-beautifulsoup4
-feedparser
 requests
+
+# Verification (from your script)
+feedparser
+beautifulsoup4
 transformers
 torch
-streamlit-folium
-plotly
-folium
-streamlit-lottie
+
+streamlit
+
