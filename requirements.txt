@@ -16,6 +16,7 @@ transformers
 torch
 
 streamlit
+
 folium
 streamlit-folium
-
+reverse_geocoder
