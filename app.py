@@ -27,7 +27,7 @@ st.divider()
 def load_ai_brain():
     try:
         bst = xgb.Booster()
-        bst.load_model('xgb_flood_model.json')
+        bst.load_model('xgb_cloudburst_model.json')
         with open('model_columns.json', 'r') as f:
             cols = json.load(f)
         return bst, cols
@@ -37,7 +37,7 @@ def load_ai_brain():
 bst, model_cols = load_ai_brain()
 
 if not bst:
-    st.error("❌ CRITICAL ERROR: Model files not found. Please upload 'xgb_flood_model.json' and 'model_columns.json'.")
+    st.error("❌ CRITICAL ERROR: Model files not found. Please upload 'xgb_cloudburst_model.json' and 'model_columns.json'.")
     st.stop()
 
 # --- DATA FETCHING ---
@@ -231,3 +231,4 @@ with tab2:
         if st.button("Clear Results"):
             st.session_state['scan_data'] = None
             st.rerun()
+
